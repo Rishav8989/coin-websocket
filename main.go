@@ -4,14 +4,13 @@ import (
 	"database/sql"
 	"encoding/json"
 	"log"
-	"sync"
+	"net/http"
 	"time"
 
-	"github.com/gorilla/websocket"
 	_ "github.com/mattn/go-sqlite3"
 )
 
-// Coin represents the structure of each coin in the JSON response
+// Coin represents the structure of each coin in the JSON data from the API
 type Coin struct {
 	ID               int    `json:"id"`
 	FullName         string `json:"full_name"`
@@ -24,109 +23,95 @@ type Coin struct {
 	DepositStatus    string `json:"deposit_status"`
 	WithdrawalStatus string `json:"withdrawal_status"`
 	Icon             string `json:"icon"`
-	Timestamp        string `json:"timestamp"`
 }
 
-// GetCoinsFromDB retrieves all coins from the database
-func GetCoinsFromDB(db *sql.DB) ([]Coin, error) {
-	rows, err := db.Query(`SELECT id, full_name, coin, buy_limit, sell_limit, withdrawal_fee, deposit_fees, status, deposit_status, withdrawal_status, icon, timestamp FROM coins`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
+// APIResponse represents the structure of the API response
+type APIResponse struct {
+	Coins []Coin `json:"coins"`
+}
 
-	var coins []Coin
-	for rows.Next() {
-		var coin Coin
-		if err := rows.Scan(&coin.ID, &coin.FullName, &coin.Coin, &coin.BuyLimit, &coin.SellLimit, &coin.WithdrawalFee, &coin.DepositFees, &coin.Status, &coin.DepositStatus, &coin.WithdrawalStatus, &coin.Icon, &coin.Timestamp); err != nil {
-			return nil, err
+func fetchAndStoreCoins(db *sql.DB) {
+	client := &http.Client{Timeout: 10 * time.Second}
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			log.Println("Fetching data from API...")
+			resp, err := client.Get("https://authentication.bit24hr.in/api/v1/get-coins")
+			if err != nil {
+				log.Println("Error fetching data:", err)
+				continue
+			}
+
+			if resp.StatusCode != http.StatusOK {
+				log.Println("Error: non-200 status code received:", resp.StatusCode)
+				resp.Body.Close()
+				continue
+			}
+
+			var apiResponse APIResponse
+			err = json.NewDecoder(resp.Body).Decode(&apiResponse)
+			resp.Body.Close()
+			if err != nil {
+				log.Println("Error decoding JSON data:", err)
+				continue
+			}
+
+			log.Println("Data fetched successfully. Storing in database...")
+			timestamp := time.Now().Unix()
+
+			for _, coin := range apiResponse.Coins {
+				_, err := db.Exec("INSERT INTO coins (id, full_name, coin, buy_limit, sell_limit, withdrawal_fee, deposit_fees, status, deposit_status, withdrawal_status, icon, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+					coin.ID, coin.FullName, coin.Coin, coin.BuyLimit, coin.SellLimit, coin.WithdrawalFee, coin.DepositFees, coin.Status, coin.DepositStatus, coin.WithdrawalStatus, coin.Icon, timestamp)
+				if err != nil {
+					log.Println("Error inserting data:", err)
+				} else {
+					log.Printf("Inserted coin: %d, %s, %s at %d\n", coin.ID, coin.Coin, coin.FullName, timestamp)
+				}
+			}
+
+			log.Println("Data stored successfully.")
 		}
-		coins = append(coins, coin)
 	}
-	return coins, nil
-}
-
-// StartWebSocketClient starts a WebSocket client that sends each coin data fetched from the database
-func StartWebSocketClient(db *sql.DB, addr string) {
-	// Initialize WebSocket client
-	client := &websocket.Dialer{
-		HandshakeTimeout: 10 * time.Second,
-		Subprotocols:     []string{"websocket"},
-	}
-
-	// Connect to WebSocket endpoint
-	conn, _, err := client.Dial(addr, nil)
-	if err != nil {
-		log.Fatalf("error connecting to WebSocket endpoint: %v", err)
-	}
-	defer conn.Close()
-
-	log.Printf("connected to WebSocket server: %s", addr)
-
-	// Fetch the coins from the database
-	coins, err := GetCoinsFromDB(db)
-	if err != nil {
-		log.Fatalf("error fetching coins from database: %v", err)
-	}
-
-	var wg sync.WaitGroup
-	wg.Add(len(coins))
-
-	// Send each coin in a separate Goroutine
-	for _, coin := range coins {
-		go func(c Coin) {
-			defer wg.Done()
-
-			// Marshal coin data to JSON
-			data, err := json.Marshal(c)
-			if err != nil {
-				log.Printf("error marshaling JSON: %v", err)
-				return
-			}
-
-			// Write data to WebSocket connection
-			err = conn.WriteMessage(websocket.TextMessage, data)
-			if err != nil {
-				log.Printf("error writing message to WebSocket: %v", err)
-				return
-			}
-		}(coin)
-	}
-
-	wg.Wait()
-	log.Println("All coins sent to WebSocket server")
 }
 
 func main() {
-	// Open a connection to the SQLite database
-	db, err := sql.Open("sqlite3", "./coins.db")
+	// Connect to the SQLite database
+	db, err := sql.Open("sqlite3", "./new_coin.db")
 	if err != nil {
-		log.Fatalf("error connecting to database: %v", err)
+		log.Fatal("Error connecting to database:", err)
 	}
 	defer db.Close()
 
-	// Ensure the coins table exists with a timestamp column
-	_, err = db.Exec(`
-		CREATE TABLE IF NOT EXISTS coins (
-			id INTEGER,
-			full_name TEXT,
-			coin TEXT,
-			buy_limit INTEGER,
-			sell_limit INTEGER,
-			withdrawal_fee TEXT,
-			deposit_fees TEXT,
-			status TEXT,
-			deposit_status TEXT,
-			withdrawal_status TEXT,
-			icon TEXT,
-			timestamp TEXT,
-			PRIMARY KEY (id, timestamp)
-		);
-	`)
+	// Drop the coins table if it exists (for this example, to ensure correct schema)
+	_, err = db.Exec(`DROP TABLE IF EXISTS coins`)
 	if err != nil {
-		log.Fatalf("error creating table: %v", err)
+		log.Fatal("Error dropping table:", err)
 	}
 
-	// Start WebSocket client
-	StartWebSocketClient(db, "wss://stream.bit24hr.in/coin_market_history/")
+	// Create the coins table with the correct schema
+	_, err = db.Exec(`CREATE TABLE coins (
+		id INTEGER,
+		full_name TEXT,
+		coin TEXT,
+		buy_limit INTEGER,
+		sell_limit INTEGER,
+		withdrawal_fee TEXT,
+		deposit_fees TEXT,
+		status TEXT,
+		deposit_status TEXT,
+		withdrawal_status TEXT,
+		icon TEXT,
+		timestamp INTEGER
+	)`)
+	if err != nil {
+		log.Fatal("Error creating table:", err)
+	}
+
+	log.Println("Database connected and table ensured. Starting data fetch routine...")
+
+	// Start the routine to fetch and store coins every second
+	fetchAndStoreCoins(db)
 }
